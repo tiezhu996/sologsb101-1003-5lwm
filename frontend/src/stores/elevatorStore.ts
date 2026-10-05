@@ -147,7 +147,8 @@ export const useElevatorStore = defineStore('elevator', () => {
       const overduePlanCount = ownedPlans.filter((item) => isPlanOverdue(item)).length;
       const pendingRectifyCount = rectifies.value.filter((item) => {
         if (item.elevatorId !== elevator.id) return false;
-        return item.state === 'pending' && overdueDaysOf(item.dueDate, item.state) >= 0;
+        // 未复核开口单（待整改 + 待复核）都计入待整改数
+        return item.state !== 'reviewed' && overdueDaysOf(item.dueDate, item.state) >= 0;
       }).length;
       const ownedRescues = rescues.value
         .filter((item) => item.elevatorId === elevator.id)
@@ -170,7 +171,7 @@ export const useElevatorStore = defineStore('elevator', () => {
   );
 
   const pendingRectifyTotal = computed(
-    () => rectifies.value.filter((item) => item.state === 'pending').length,
+    () => rectifies.value.filter((item) => item.state !== 'reviewed').length,
   );
 
   return {

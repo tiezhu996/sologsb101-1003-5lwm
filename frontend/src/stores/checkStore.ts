@@ -6,14 +6,17 @@ import { computed, ref } from 'vue';
 import { defineStore } from 'pinia';
 import {
   ROW_REVISION,
+  commitPlanExecution,
   listCheckItems,
   listElevators,
   listPlans,
   putCheckItem,
-  putCheckItems,
-  removeCheckItem,
+  putCheckItemsWithSync,
+  removeCheckItemWithSync,
+  replacePlanCheckItems,
   type CheckItemRow,
   type ElevatorRow,
+  type PlanExecutionResult,
   type PlanRow,
 } from '../utils/db';
 import {
@@ -121,22 +124,24 @@ export const useCheckStore = defineStore('check', () => {
     };
   });
 
-  /** 保存单项结果 */
+  /** 保存单项结果（异常项作废联动整改单回待复核） */
   async function saveItem(itemId: string, draft: CheckItemDraft): Promise<void> {
     const existing = items.value.find((item) => item.id === itemId);
     if (!existing) return;
-    await putCheckItem({
-      ...existing,
-      itemName: draft.itemName.trim(),
-      result: draft.result,
-      value: draft.value.trim(),
-      remark: draft.remark.trim(),
-    });
+    await putCheckItemsWithSync([
+      {
+        ...existing,
+        itemName: draft.itemName.trim(),
+        result: draft.result,
+        value: draft.value.trim(),
+        remark: draft.remark.trim(),
+      },
+    ]);
     emitChange();
   }
 
-  /** 批量保存当前计划的全部结果 */
-  async function saveAll(planId: string, drafts: Array<{ id: string } & CheckItemDraft>): Promise<number> {
+  /** 把草稿行合并为待落库的保养项 */
+  function toRows(drafts: Array<{ id: string } & CheckItemDraft>): CheckItemRow[] {
     const rows: CheckItemRow[] = [];
     for (const draft of drafts) {
       const existing = items.value.find((item) => item.id === draft.id);
@@ -149,8 +154,33 @@ export const useCheckStore = defineStore('check', () => {
         remark: draft.remark.trim(),
       });
     }
+    return rows;
+  }
+
+  /**
+   * 保养执行一次本地事务：保存草稿（可附带签署 / 异常项转整改）。
+   * 失败整体回滚，页面草稿不丢，重试按去重键幂等不重复建单。
+   */
+  async function commitExecution(
+    planId: string,
+    drafts: Array<{ id: string } & CheckItemDraft>,
+    options: { sign?: boolean; rectify?: { dueDate: string; reviewer: string } | null } = {},
+  ): Promise<PlanExecutionResult> {
+    const result = await commitPlanExecution({
+      planId,
+      items: toRows(drafts),
+      sign: options.sign ?? false,
+      rectify: options.rectify ?? null,
+    });
+    emitChange();
+    return result;
+  }
+
+  /** 批量保存当前计划的全部结果 */
+  async function saveAll(planId: string, drafts: Array<{ id: string } & CheckItemDraft>): Promise<number> {
+    const rows = toRows(drafts);
     if (rows.length === 0) return 0;
-    await putCheckItems(rows);
+    await putCheckItemsWithSync(rows);
     void planId;
     emitChange();
     return rows.length;
@@ -160,7 +190,7 @@ export const useCheckStore = defineStore('check', () => {
   async function setResult(itemId: string, result: CheckResult): Promise<void> {
     const existing = items.value.find((item) => item.id === itemId);
     if (!existing) return;
-    await putCheckItem({ ...existing, result });
+    await putCheckItemsWithSync([{ ...existing, result }]);
     emitChange();
   }
 
@@ -168,7 +198,7 @@ export const useCheckStore = defineStore('check', () => {
   async function fillRestNormal(planId: string): Promise<number> {
     const targets = items.value.filter((item) => item.planId === planId && item.result === null);
     if (targets.length === 0) return 0;
-    await putCheckItems(
+    await putCheckItemsWithSync(
       targets.map((item) => ({
         ...item,
         result: 'normal' as CheckResult,
@@ -200,7 +230,7 @@ export const useCheckStore = defineStore('check', () => {
   }
 
   async function deleteItem(itemId: string): Promise<void> {
-    await removeCheckItem(itemId);
+    await removeCheckItemWithSync(itemId);
     emitChange();
   }
 
@@ -208,8 +238,6 @@ export const useCheckStore = defineStore('check', () => {
   async function resetItemsToLibrary(planId: string): Promise<number> {
     const plan = plans.value.find((item) => item.id === planId);
     const cycle = plan?.cycleType ?? 'halfMonth';
-    const scoped = items.value.filter((item) => item.planId === planId);
-    await Promise.all(scoped.map((item) => removeCheckItem(item.id)));
     const rows: CheckItemRow[] = itemsForCycle(cycle).map((itemName, index) => ({
       id: `chk-${planId}-${index + 1}`,
       planId,
@@ -221,7 +249,7 @@ export const useCheckStore = defineStore('check', () => {
       createdAt: nowDateTime(),
       revision: ROW_REVISION,
     }));
-    await putCheckItems(rows);
+    await replacePlanCheckItems(planId, rows);
     emitChange();
     return rows.length;
   }
@@ -245,6 +273,7 @@ export const useCheckStore = defineStore('check', () => {
     resultCounts,
     saveItem,
     saveAll,
+    commitExecution,
     setResult,
     fillRestNormal,
     addItem,

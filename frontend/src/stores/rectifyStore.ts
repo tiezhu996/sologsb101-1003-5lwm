@@ -1,27 +1,26 @@
 /**
  * 年检整改状态（Pinia）
- * 维护整改单跟踪、复核关闭与超期预警派生值。
+ * 维护整改单跟踪、复核关闭与超期预警派生值；
+ * 列表只含主单（重复单已在持久层归并），新建走幂等事务。
  */
 import { computed, ref } from 'vue';
 import { defineStore } from 'pinia';
 import {
-  ROW_REVISION,
   listElevators,
   listRectifies,
   putRectify,
-  listCheckItems,
+  createRectifyIdempotent,
   removeRectify,
-  type CheckItemRow,
   type ElevatorRow,
   type RectifyRow,
 } from '../utils/db';
 import {
   overdueDaysOf,
+  rectifyDedupeKey,
   type RectifyDraft,
   type RectifyView,
 } from '../types/rectify';
 import { nowDateTime } from '../utils/duration';
-import { uuid } from '../utils/export';
 import { emitChange, onChange } from '../utils/events';
 
 export const useRectifyStore = defineStore('rectify', () => {
@@ -57,21 +56,14 @@ export const useRectifyStore = defineStore('rectify', () => {
     await load();
   }
 
-  async function createRectify(draft: RectifyDraft): Promise<RectifyRow> {
-    const row: RectifyRow = {
-      id: uuid(),
-      elevatorId: draft.elevatorId,
-      item: draft.item.trim(),
-      dueDate: draft.dueDate,
-      state: 'pending',
-      reviewer: draft.reviewer.trim(),
-      reviewedAt: null,
-      createdAt: nowDateTime(),
-      revision: ROW_REVISION,
-    };
-    await putRectify(row);
+  /**
+   * 幂等登记整改单：同一电梯同一不合格项只留一条有效单，
+   * 已存在有效单时复用并返回 reused = true，重复提交不产生新单。
+   */
+  async function createRectify(draft: RectifyDraft): Promise<{ row: RectifyRow; reused: boolean }> {
+    const result = await createRectifyIdempotent(draft);
     emitChange();
-    return row;
+    return result;
   }
 
   async function updateRectify(id: string, draft: RectifyDraft): Promise<void> {
@@ -83,11 +75,12 @@ export const useRectifyStore = defineStore('rectify', () => {
       item: draft.item.trim(),
       dueDate: draft.dueDate,
       reviewer: draft.reviewer.trim(),
+      dedupeKey: rectifyDedupeKey(draft.elevatorId, draft.item),
     });
     emitChange();
   }
 
-  /** 复核通过：关闭整改单并回写复核人与时间 */
+  /** 复核通过：关闭整改单并回写复核人与时间（待整改 / 待复核均可复核） */
   async function review(id: string, reviewer: string): Promise<void> {
     const existing = rectifies.value.find((item) => item.id === id);
     if (!existing) return;
@@ -108,38 +101,20 @@ export const useRectifyStore = defineStore('rectify', () => {
     emitChange();
   }
 
+  /** 待复核单确认无误：退回待整改继续跟踪 */
+  async function resumeRectify(id: string): Promise<void> {
+    const existing = rectifies.value.find((item) => item.id === id);
+    if (!existing || existing.state !== 'recheck') return;
+    await putRectify({ ...existing, state: 'pending' });
+    emitChange();
+  }
+
   async function deleteRectify(id: string): Promise<void> {
     await removeRectify(id);
     emitChange();
   }
 
-  /**
-   * 由保养异常项一键转整改单（调用方传入电梯与计划上下文，避免反向依赖）。
-   * 同电梯同项目已存在待整改单时跳过，返回实际新建数量。
-   */
-  async function promoteAbnormalItems(
-    elevatorId: string,
-    planId: string,
-    dueDate: string,
-    reviewer: string,
-  ): Promise<number> {
-    const items: CheckItemRow[] = await listCheckItems();
-    const targets = items.filter(
-      (item) => item.planId === planId && (item.result === 'abnormal' || item.result === 'advice'),
-    );
-    let created = 0;
-    for (const item of targets) {
-      const exists = rectifies.value.some(
-        (row) => row.elevatorId === elevatorId && row.item === item.itemName && row.state === 'pending',
-      );
-      if (exists) continue;
-      await createRectify({ elevatorId, item: item.itemName, dueDate, reviewer });
-      created += 1;
-    }
-    return created;
-  }
-
-  /** 整改单视图：附电梯上下文与超期天数 */
+  /** 整改单视图：附电梯上下文与超期天数（仅主单） */
   const rectifyViews = computed<RectifyView[]>(() =>
     rectifies.value.map((row) => {
       const elevator = elevators.value.find((item) => item.id === row.elevatorId);
@@ -155,6 +130,9 @@ export const useRectifyStore = defineStore('rectify', () => {
   );
 
   const pendingViews = computed(() => rectifyViews.value.filter((item) => item.state === 'pending'));
+  const recheckViews = computed(() => rectifyViews.value.filter((item) => item.state === 'recheck'));
+  /** 未复核开口单（待整改 + 待复核） */
+  const openViews = computed(() => rectifyViews.value.filter((item) => item.state !== 'reviewed'));
   const overdueViews = computed(() =>
     rectifyViews.value
       .filter((item) => item.overdue)
@@ -167,17 +145,17 @@ export const useRectifyStore = defineStore('rectify', () => {
     return Number(((reviewedViews.value.length / rectifyViews.value.length) * 100).toFixed(1));
   });
 
-  /** 按使用单位统计待整改量 */
+  /** 按使用单位统计未复核整改量 */
   const byOwner = computed(() => {
-    const buckets = new Map<string, { owner: string; pending: number; overdue: number; total: number }>();
+    const buckets = new Map<string, { owner: string; open: number; overdue: number; total: number }>();
     for (const row of rectifyViews.value) {
-      const bucket = buckets.get(row.owner) ?? { owner: row.owner, pending: 0, overdue: 0, total: 0 };
+      const bucket = buckets.get(row.owner) ?? { owner: row.owner, open: 0, overdue: 0, total: 0 };
       bucket.total += 1;
-      if (row.state === 'pending') bucket.pending += 1;
+      if (row.state !== 'reviewed') bucket.open += 1;
       if (row.overdue) bucket.overdue += 1;
       buckets.set(row.owner, bucket);
     }
-    return [...buckets.values()].sort((a, b) => b.pending - a.pending);
+    return [...buckets.values()].sort((a, b) => b.open - a.open);
   });
 
   return {
@@ -192,10 +170,12 @@ export const useRectifyStore = defineStore('rectify', () => {
     updateRectify,
     review,
     revokeReview,
+    resumeRectify,
     deleteRectify,
-    promoteAbnormalItems,
     rectifyViews,
     pendingViews,
+    recheckViews,
+    openViews,
     overdueViews,
     reviewedViews,
     reviewRate,

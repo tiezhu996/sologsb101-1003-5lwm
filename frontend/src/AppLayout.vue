@@ -96,7 +96,7 @@ function onMenuSelect(key: string): void {
         <div>
           困人均值 {{ formatAverageMinutes(rescueStore.rescueViews.reduce((sum, item) => sum + item.rescueMinutes, 0), rescueStore.rescueViews.length) }}
         </div>
-        <div>待整改 {{ rectifyStore.pendingViews.length }} 项</div>
+        <div>待整改 {{ rectifyStore.openViews.length }} 项</div>
       </div>
     </n-layout-sider>
 

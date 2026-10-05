@@ -90,7 +90,7 @@ sologsb101-1003/
 ## 六、数据存储说明
 
 - **存储介质**：浏览器 IndexedDB，库名 **`gbelevsvc`**，通过 Dexie 4.x 封装。
-- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 2`，并登记 v1 → v2 的 `upgrade` 迁移（补齐行修订号、迁移 `executorName → executor`、初始化保养项结果字段、新增 `settings` 表）。
+- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 3`，并登记 v1 → v2 → v3 的 `upgrade` 迁移（v2 补齐行修订号、迁移 `executorName → executor`、新增 `settings` 表；v3 整改单补充去重键与来源 / 归并字段，历史重复整改单归并为一条主单并留来源）。
 - **数据表**：
 
   | 表名 | 实体 | 主要索引 |
@@ -99,9 +99,12 @@ sologsb101-1003/
   | `plans` | 保养计划 | id / elevatorId / cycleType / state / planDate / executor / [elevatorId+planDate] |
   | `checkItems` | 保养项 | id / planId / seq / result / itemName / [planId+seq] |
   | `rescues` | 困人事件 | id / elevatorId / alarmAt / responder |
-  | `rectifies` | 整改单 | id / elevatorId / state / dueDate / reviewer |
+  | `rectifies` | 整改单 | id / elevatorId / state / dueDate / reviewer / dedupeKey / sourcePlanId / sourceItemId / mergedInto |
   | `settings` | 自定义字典 | id |
 
+- **保养执行一次本地事务**：`commitPlanExecution()` 把保养项落库、计划签署、异常项转整改放进同一个 Dexie 事务，要么全部生效要么整体回滚；写入失败后签署草稿与已完成项不落库也不丢失，重试按去重键（电梯 + 不合格项）幂等，同一异常只留一条有效整改单，重复提交 / 双终端并发返回已有单。
+- **整改状态联动**：整改单状态为 待整改 / 待复核 / 已复核。计划改期、更换电梯或异常项作废（结果改回非异常、删除、重置清单）后，来源于该计划的未复核整改单自动回到待复核，已复核结论照旧保留；待复核单可「复核通过」关闭或「退回整改」继续跟踪。
+- **重复单归并**：结构升级（及导入旧版 JSON）时，同电梯同项目的重复整改单归并为一条主单（已复核优先、其次创建最早），其余单标记 `mergedInto` 留来源，主单 `mergedFrom` 记录来源单 id；列表与 JSON / CSV 导出只按主单展示。
 - **首屏自动播种**：`initDatabase()` 在 `elevators` 表为空时写入演示数据（幂等）——3 台电梯 × 各 2~4 期计划 × 每期 5~10 个保养项（含异常 / 建议项）+ 3 起困人事件 + 5 条整改单，父子记录通过 `elevatorId / planId` 互相引用。
 - **跨页状态**：全部放在 Pinia store（`elevatorStore / planStore / checkStore / rescueStore / rectifyStore`），页面只读 store；Dexie 写入后由 `utils/events.ts` 广播，各 store 自动重新拉取。
 - **数据不出浏览器**：容器无状态，不挂载卷、不使用数据库服务。

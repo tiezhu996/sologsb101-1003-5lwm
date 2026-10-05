@@ -1,7 +1,7 @@
 <script setup lang="ts">
 /**
  * <StateTag> 状态徽标
- * 按待执行/执行中/已签署、待整改/已复核渲染状态底色，
+ * 按待执行/执行中/已签署、待整改/待复核/已复核渲染状态底色，
  * 被保养计划页、保养执行页、整改页消费。
  */
 import { computed } from 'vue';
@@ -34,6 +34,7 @@ const PLAN_TONE: Record<PlanState, TagTone> = {
 
 const RECTIFY_TONE: Record<RectifyState, TagTone> = {
   pending: 'warning',
+  recheck: 'info',
   reviewed: 'success',
 };
 

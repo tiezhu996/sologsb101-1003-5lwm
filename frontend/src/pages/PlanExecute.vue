@@ -2,6 +2,7 @@
 /**
  * /plans/:id/items 保养执行
  * 逐项填写实测值与结果并签署，异常项一键转整改；
+ * 保存 / 签署 / 转整改走同一次本地事务，失败整体回滚、草稿保留可重试；
  * 消费 CheckItem、Plan 与 <StateTag>。
  */
 import { computed, h, onMounted, ref, watch } from 'vue';
@@ -57,6 +58,8 @@ interface DraftRow {
 const drafts = ref<Record<string, DraftRow>>({});
 const rectifyDueTs = ref<number>(new Date(`${addDays(todayDate(), 7)}T00:00:00`).getTime());
 const reviewer = ref('王敏');
+/** 事务提交中：防双击与并发重复提交 */
+const submitting = ref(false);
 
 /** 当前时间文案（用于未签署时的提示占位） */
 const nowDateTimeText = nowDateTime();
@@ -114,14 +117,26 @@ const progressPercent = computed(() => {
   return Number(((filledCount.value / items.value.length) * 100).toFixed(1));
 });
 
-/** 保存全部草稿 */
-async function saveAll(): Promise<void> {
-  const payload = items.value.map((item) => ({
+/** 汇总当前草稿为待落库负载 */
+function buildPayload(): Array<{ id: string } & DraftRow> {
+  return items.value.map((item) => ({
     id: item.id,
     ...(drafts.value[item.id] ?? { itemName: item.itemName, result: item.result, value: item.value, remark: item.remark }),
   }));
-  const saved = await checkStore.saveAll(planId.value, payload);
-  message.success(`已保存 ${saved} 项保养结果`);
+}
+
+/** 保存全部草稿（异常项作废会联动整改单回待复核） */
+async function saveAll(): Promise<void> {
+  if (submitting.value) return;
+  submitting.value = true;
+  try {
+    const saved = await checkStore.saveAll(planId.value, buildPayload());
+    message.success(`已保存 ${saved} 项保养结果`);
+  } catch (cause) {
+    message.error(`保存失败：${cause instanceof Error ? cause.message : '本地写入异常'}，草稿已保留，可重试`);
+  } finally {
+    submitting.value = false;
+  }
 }
 
 /** 快捷标记单项结果并立即落库 */
@@ -153,17 +168,23 @@ async function fillRest(): Promise<void> {
   message.success(`已将其余 ${rest.length} 项标为正常`);
 }
 
-/** 签署：先保存再校验 */
+/** 签署：草稿与计划签署放进一次本地事务，失败整体回滚、草稿保留 */
 async function signPlan(): Promise<void> {
-  await saveAll();
-  const result = await planStore.signPlan(planId.value);
-  if (result.ok) message.success('保养计划已签署');
-  else message.warning(result.message);
+  if (submitting.value) return;
+  submitting.value = true;
+  try {
+    const result = await checkStore.commitExecution(planId.value, buildPayload(), { sign: true });
+    if (result.signed) message.success('保养计划已签署');
+  } catch (cause) {
+    message.warning(`${cause instanceof Error ? cause.message : '签署失败'}，草稿已保留，可重试`);
+  } finally {
+    submitting.value = false;
+  }
 }
 
-/** 异常项一键转整改 */
+/** 异常项一键转整改：与草稿保存同事务；同一异常只留一条有效单，重复提交复用已有单 */
 async function promote(): Promise<void> {
-  if (!plan.value) return;
+  if (!plan.value || submitting.value) return;
   if (abnormalDrafts.value.length === 0) {
     message.warning('当前没有异常项可转整改');
     return;
@@ -171,10 +192,25 @@ async function promote(): Promise<void> {
   const date = new Date(rectifyDueTs.value);
   const pad = (value: number): string => String(value).padStart(2, '0');
   const dueDate = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
-  await saveAll();
-  const created = await rectifyStore.promoteAbnormalItems(plan.value.elevatorId, planId.value, dueDate, reviewer.value);
-  if (created === 0) message.info('异常项均已有待整改单，未重复生成');
-  else message.success(`已生成 ${created} 条年检整改单`);
+  submitting.value = true;
+  try {
+    const result = await checkStore.commitExecution(planId.value, buildPayload(), {
+      rectify: { dueDate, reviewer: reviewer.value },
+    });
+    const created = result.createdRectifies.length;
+    const reused = result.reusedRectifies.length;
+    if (created === 0 && reused > 0) {
+      message.info('异常项均已有有效整改单，未重复生成');
+    } else if (created > 0) {
+      message.success(`已生成 ${created} 条年检整改单${reused > 0 ? `，${reused} 项复用已有单` : ''}`);
+    } else {
+      message.info('没有需要转整改的异常项');
+    }
+  } catch (cause) {
+    message.error(`转整改失败：${cause instanceof Error ? cause.message : '本地写入异常'}，草稿已保留，可重试`);
+  } finally {
+    submitting.value = false;
+  }
 }
 
 const elevatorRemind = computed(() => {
@@ -279,8 +315,8 @@ const columns = computed<DataTableColumns<CheckItemView>>(() => [
       </div>
       <n-space>
         <n-button @click="router.push(ROUTES.plans)">返回计划列表</n-button>
-        <n-button @click="saveAll">保存全部</n-button>
-        <n-button type="primary" :disabled="plan?.state === 'signed'" @click="signPlan">签署计划</n-button>
+        <n-button :disabled="submitting" @click="saveAll">保存全部</n-button>
+        <n-button type="primary" :disabled="plan?.state === 'signed' || submitting" :loading="submitting" @click="signPlan">签署计划</n-button>
       </n-space>
     </div>
 
@@ -350,7 +386,7 @@ const columns = computed<DataTableColumns<CheckItemView>>(() => [
           <n-text depth="3" style="font-size: 12px">整改限期</n-text>
           <n-date-picker v-model:value="rectifyDueTs" type="date" size="small" style="width: 150px" />
           <n-input v-model:value="reviewer" size="small" placeholder="复核人" style="width: 120px" />
-          <n-button size="small" type="primary" @click="promote">异常项转整改</n-button>
+          <n-button size="small" type="primary" :disabled="submitting" @click="promote">异常项转整改</n-button>
         </n-space>
 
         <n-data-table

@@ -111,7 +111,7 @@ const filteredViews = computed(() => {
 const overview = computed(() => {
   const views = elevatorStore.elevatorViews;
   const overduePlans = views.reduce((sum, item) => sum + item.overduePlanCount, 0);
-  const pendingRectifies = rectifyStore.pendingViews.length;
+  const pendingRectifies = rectifyStore.openViews.length;
   const withRescue = views.filter((item) => item.lastRescueMinutes !== null);
   const avgRescue =
     withRescue.length === 0

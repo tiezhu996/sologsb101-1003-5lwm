@@ -146,8 +146,9 @@ async function submit(): Promise<void> {
     await rectifyStore.updateRectify(editingId.value, draft);
     message.success('整改单已更新');
   } else {
-    await rectifyStore.createRectify(draft);
-    message.success('整改单已登记');
+    const result = await rectifyStore.createRectify(draft);
+    if (result.reused) message.info('同一电梯已存在该项目的有效整改单，未重复登记');
+    else message.success('整改单已登记');
   }
   modalOpen.value = false;
 }
@@ -183,17 +184,34 @@ async function handleReset(): Promise<void> {
 }
 
 function exportOverdueCsv(): void {
-  const rows: Array<Array<string | number>> = [['电梯', '不合格项', '限期', '状态', '超期天数', '复核人']];
+  const rows: Array<Array<string | number>> = [['电梯', '不合格项', '限期', '状态', '超期天数', '复核人', '归并来源数']];
   for (const row of rectifyStore.rectifyViews) {
-    rows.push([row.elevatorName, row.item, row.dueDate, RECTIFY_STATE_LABEL[row.state], row.overdueDays, row.reviewer]);
+    rows.push([row.elevatorName, row.item, row.dueDate, RECTIFY_STATE_LABEL[row.state], row.overdueDays, row.reviewer, row.mergedFrom.length]);
   }
   downloadCsv(`gbelevsvc-rectify-${todayDate()}.csv`, rows);
-  message.success('整改清单已导出 CSV');
+  message.success('整改清单已导出 CSV（仅主单）');
 }
 
 const columns = computed<DataTableColumns<RectifyView>>(() => [
   { title: '电梯', key: 'elevatorName', minWidth: 210, ellipsis: { tooltip: true } },
-  { title: '不合格项', key: 'item', minWidth: 180 },
+  {
+    title: '不合格项',
+    key: 'item',
+    minWidth: 200,
+    render: (row) =>
+      h(NSpace, { size: 4, align: 'center' }, {
+        default: () => [
+          h('span', row.item),
+          row.mergedFrom.length > 0
+            ? h(
+                NTag,
+                { size: 'tiny', round: true, type: 'info' },
+                { default: () => `已归并 ${row.mergedFrom.length} 条重复单` },
+              )
+            : null,
+        ],
+      }),
+  },
   { title: '限期', key: 'dueDate', width: 120 },
   {
     title: '状态',
@@ -211,12 +229,12 @@ const columns = computed<DataTableColumns<RectifyView>>(() => [
   {
     title: '操作',
     key: 'actions',
-    width: 210,
+    width: 260,
     fixed: 'right',
     render: (row) =>
       h(NSpace, { size: 2 }, {
         default: () => [
-          row.state === 'pending'
+          row.state !== 'reviewed'
             ? h(
                 NButton,
                 {
@@ -243,6 +261,21 @@ const columns = computed<DataTableColumns<RectifyView>>(() => [
                 },
                 { default: () => '撤销复核' },
               ),
+          row.state === 'recheck'
+            ? h(
+                NButton,
+                {
+                  size: 'tiny',
+                  text: true,
+                  type: 'info',
+                  onClick: async () => {
+                    await rectifyStore.resumeRectify(row.id);
+                    message.info('已确认，退回待整改继续跟踪');
+                  },
+                },
+                { default: () => '退回整改' },
+              )
+            : null,
           h(NButton, { size: 'tiny', text: true, onClick: () => openEdit(row) }, { default: () => '编辑' }),
           h(
             NButton,
@@ -295,11 +328,11 @@ const columns = computed<DataTableColumns<RectifyView>>(() => [
     <div class="stat-grid">
       <stat-badge title="整改单总数" :value="rectifyStore.rectifyViews.length" suffix="条" color="#18a058" />
       <stat-badge
-        title="待整改"
-        :value="rectifyStore.pendingViews.length"
+        title="待整改 / 待复核"
+        :value="rectifyStore.openViews.length"
         suffix="条"
         color="#f0a020"
-        hint="未复核关闭的整改项"
+        :hint="`待整改 ${rectifyStore.pendingViews.length} 条 · 待复核 ${rectifyStore.recheckViews.length} 条`"
       />
       <stat-badge
         title="超期预警"
@@ -329,6 +362,7 @@ const columns = computed<DataTableColumns<RectifyView>>(() => [
           label: '状态',
           options: [
             { label: '待整改', value: 'pending' },
+            { label: '待复核', value: 'recheck' },
             { label: '已复核', value: 'reviewed' },
           ],
           width: 180,
@@ -395,12 +429,12 @@ const columns = computed<DataTableColumns<RectifyView>>(() => [
               <n-space justify="space-between" align="center">
                 <n-text style="font-size: 13px">{{ group.owner }}</n-text>
                 <n-text depth="3" style="font-size: 12px">
-                  待整改 {{ group.pending }} / 共 {{ group.total }}
+                  未复核 {{ group.open }} / 共 {{ group.total }}
                 </n-text>
               </n-space>
               <n-progress
                 type="line"
-                :percentage="group.total === 0 ? 0 : Number((((group.total - group.pending) / group.total) * 100).toFixed(1))"
+                :percentage="group.total === 0 ? 0 : Number((((group.total - group.open) / group.total) * 100).toFixed(1))"
                 :height="6"
                 :show-indicator="false"
                 color="#18a058"

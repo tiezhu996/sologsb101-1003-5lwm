@@ -6,12 +6,14 @@ import { computed, ref } from 'vue';
 import { defineStore } from 'pinia';
 import {
   ROW_REVISION,
+  commitPlanExecution,
   listCheckItems,
   listElevators,
   listPlans,
   planDatesFrom,
   putPlan,
   putPlans,
+  putPlanWithSync,
   putCheckItems,
   removePlan,
   type CheckItemRow,
@@ -165,10 +167,14 @@ export const usePlanStore = defineStore('plan', () => {
     return rows.length;
   }
 
+  /**
+   * 编辑计划（改期 / 更换电梯 / 换执行人）：
+   * 走联动事务，改期或换梯后来源未复核整改单回到待复核，已复核结论照旧保留。
+   */
   async function updatePlan(id: string, draft: PlanDraft): Promise<void> {
     const existing = plans.value.find((item) => item.id === id);
     if (!existing) return;
-    await putPlan({
+    await putPlanWithSync({
       ...existing,
       elevatorId: draft.elevatorId,
       cycleType: draft.cycleType,
@@ -198,17 +204,15 @@ export const usePlanStore = defineStore('plan', () => {
     emitChange();
   }
 
-  /** 签署：要求全部保养项已填写结果 */
+  /** 签署：走保养执行事务（库内校验未填项，失败整体回滚不留中间态） */
   async function signPlan(id: string): Promise<{ ok: boolean; message: string }> {
     const existing = plans.value.find((item) => item.id === id);
     if (!existing) return { ok: false, message: '计划不存在' };
-    const items = checkItems.value.filter((item) => item.planId === id);
-    const unfilled = items.filter((item) => item.result === null);
-    if (items.length === 0) return { ok: false, message: '该计划没有保养项' };
-    if (unfilled.length > 0) {
-      return { ok: false, message: `还有 ${unfilled.length} 项未填写结果，无法签署` };
+    try {
+      await commitPlanExecution({ planId: id, items: [], sign: true, rectify: null });
+    } catch (cause) {
+      return { ok: false, message: cause instanceof Error ? cause.message : '签署失败，请重试' };
     }
-    await putPlan({ ...existing, state: 'signed', signedAt: nowDateTime() });
     emitChange();
     return { ok: true, message: '签署完成' };
   }

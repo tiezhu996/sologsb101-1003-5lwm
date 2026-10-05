@@ -9,18 +9,26 @@ import Dexie, { type Table } from 'dexie';
 import type { Elevator } from '../types/elevator';
 import type { Plan } from '../types/plan';
 import type { CheckItem, CheckResult } from '../types/checkItem';
-import { itemsForCycle } from '../types/checkItem';
+import { isAbnormal, itemsForCycle } from '../types/checkItem';
 import type { Rescue } from '../types/rescue';
 import type { Rectify } from '../types/rectify';
+import {
+  isMasterRectify,
+  isOpenRectify,
+  mergeDuplicateRectifies,
+  normalizeRectifyRow,
+  rectifyDedupeKey,
+} from '../types/rectify';
 import { ROW_REVISION, type Revisioned } from '../types/persistence';
 import { addDays, generatePlanDates, nextPlanDate } from './cycle';
 import { nowDateTime, rescueMinutes, todayDate } from './duration';
+import { uuid } from './export';
 
 /** 浏览器 IndexedDB 库名 */
 export const DB_NAME = 'gbelevsvc';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 export { ROW_REVISION };
 export type { Revisioned };
@@ -53,7 +61,7 @@ class ElevatorServiceDatabase extends Dexie {
 
     // v2：新增 revision 行修订号；计划补充 executor 索引，保养项补充 itemName 索引，
     //     困人事件补充 responder 索引，并新增 settings 表存放自定义字典
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         elevators: 'id, regCode, owner, maintCycle, useDate',
         plans: 'id, elevatorId, cycleType, state, planDate, executor, [elevatorId+planDate]',
@@ -87,6 +95,52 @@ class ElevatorServiceDatabase extends Dexie {
           if (typeof row.remark !== 'string') row.remark = '';
           if (row.result === undefined) row.result = null;
         });
+      });
+
+    // v3：整改单补充去重键与来源 / 归并字段及索引，状态机扩展"待复核"；
+    //     历史重复整改单（同电梯同项目多条）归并为一条主单并留来源
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        elevators: 'id, regCode, owner, maintCycle, useDate',
+        plans: 'id, elevatorId, cycleType, state, planDate, executor, [elevatorId+planDate]',
+        checkItems: 'id, planId, seq, result, itemName, [planId+seq]',
+        rescues: 'id, elevatorId, alarmAt, responder',
+        rectifies:
+          'id, elevatorId, state, dueDate, reviewer, dedupeKey, sourcePlanId, sourceItemId, mergedInto',
+        settings: 'id',
+      })
+      .upgrade(async (tx) => {
+        const tables: Array<Table<Record<string, unknown>, string>> = [
+          tx.table('elevators'),
+          tx.table('plans'),
+          tx.table('checkItems'),
+          tx.table('rescues'),
+          tx.table('rectifies'),
+        ];
+        for (const table of tables) {
+          await table.toCollection().modify((row: Record<string, unknown>) => {
+            row.revision = ROW_REVISION;
+            if (typeof row.createdAt !== 'string') row.createdAt = nowDateTime();
+          });
+        }
+        // 整改单：补齐去重键与来源 / 归并字段，旧状态值兜底
+        await tx.table('rectifies').toCollection().modify((row: Record<string, unknown>) => {
+          if (typeof row.dedupeKey !== 'string' || !row.dedupeKey) {
+            row.dedupeKey = `${String(row.elevatorId ?? '')}::${String(row.item ?? '').trim()}`;
+          }
+          if (typeof row.sourcePlanId !== 'string') row.sourcePlanId = null;
+          if (typeof row.sourceItemId !== 'string') row.sourceItemId = null;
+          if (typeof row.mergedInto !== 'string') row.mergedInto = null;
+          if (!Array.isArray(row.mergedFrom)) row.mergedFrom = [];
+          if (row.state !== 'reviewed' && row.state !== 'recheck') row.state = 'pending';
+        });
+        // 历史重复整改单归并：同电梯同项目只留一条主单，其余标记 mergedInto 留来源
+        const rectifyTable: Table<RectifyRow, string> = tx.table('rectifies');
+        const rows = await rectifyTable.toArray();
+        const merged = mergeDuplicateRectifies(rows);
+        if (merged.some((row, index) => row !== rows[index])) {
+          await rectifyTable.bulkPut(merged);
+        }
       });
   }
 }
@@ -122,7 +176,14 @@ interface SeedElevatorSpec {
     trappedCount: number;
     responder: string;
   }>;
-  rectifies: Array<{ item: string; dueOffsetDays: number; state: Rectify['state']; reviewer: string }>;
+  rectifies: Array<{
+    item: string;
+    dueOffsetDays: number;
+    state: Rectify['state'];
+    reviewer: string;
+    /** 来源计划（播种下标）与保养项序号；缺省表示手工登记 */
+    source?: { planIndex: number; seq: number };
+  }>;
 }
 
 const SEED_ELEVATORS: SeedElevatorSpec[] = [
@@ -160,7 +221,7 @@ const SEED_ELEVATORS: SeedElevatorSpec[] = [
       },
     ],
     rectifies: [
-      { item: '层门门锁啮合深度不足', dueOffsetDays: -5, state: 'pending', reviewer: '王敏' },
+      { item: '限速器动作', dueOffsetDays: -5, state: 'pending', reviewer: '王敏', source: { planIndex: 1, seq: 3 } },
       { item: '轿厢应急照明失效', dueOffsetDays: 12, state: 'pending', reviewer: '王敏' },
     ],
   },
@@ -188,7 +249,7 @@ const SEED_ELEVATORS: SeedElevatorSpec[] = [
       },
     ],
     rectifies: [
-      { item: '制动器制动力矩不足', dueOffsetDays: 8, state: 'pending', reviewer: '王敏' },
+      { item: '钢丝绳磨损', dueOffsetDays: 8, state: 'pending', reviewer: '王敏', source: { planIndex: 2, seq: 5 } },
     ],
   },
   {
@@ -316,6 +377,9 @@ async function seedDatabase(): Promise<void> {
     });
 
     spec.rectifies.forEach((rectifySpec, rectifyIndex) => {
+      const sourcePlanId = rectifySpec.source
+        ? `plan-${elevatorIndex + 1}-${rectifySpec.source.planIndex + 1}`
+        : null;
       rectifies.push({
         id: `rect-${elevatorIndex + 1}-${rectifyIndex + 1}`,
         elevatorId,
@@ -324,6 +388,12 @@ async function seedDatabase(): Promise<void> {
         state: rectifySpec.state,
         reviewer: rectifySpec.reviewer,
         reviewedAt: rectifySpec.state === 'reviewed' ? `${addDays(todayDate(), -3)} 10:30` : null,
+        dedupeKey: rectifyDedupeKey(elevatorId, rectifySpec.item),
+        sourcePlanId,
+        sourceItemId:
+          sourcePlanId && rectifySpec.source ? `chk-${sourcePlanId}-${rectifySpec.source.seq}` : null,
+        mergedInto: null,
+        mergedFrom: [],
         createdAt: stamp,
         revision: ROW_REVISION,
       });
@@ -400,11 +470,45 @@ export async function putPlans(rows: PlanRow[]): Promise<void> {
   await db.plans.bulkPut(rows);
 }
 
-/** 删除计划并级联删除保养项 */
+/**
+ * 更新计划并联动整改单（一次本地事务）：
+ * 计划改期或更换电梯后，来源于该计划的未复核整改单回到待复核；
+ * 更换电梯时未复核单同步迁移电梯归属与去重键；已复核结论照旧保留。
+ */
+export async function putPlanWithSync(row: PlanRow): Promise<void> {
+  await db.transaction('rw', [db.plans, db.rectifies], async () => {
+    const before = await db.plans.get(row.id);
+    await db.plans.put(row);
+    if (!before) return;
+    const dateChanged = before.planDate !== row.planDate;
+    const elevatorChanged = before.elevatorId !== row.elevatorId;
+    if (!dateChanged && !elevatorChanged) return;
+    const linked = await db.rectifies.where('sourcePlanId').equals(row.id).toArray();
+    for (const item of linked) {
+      if (!isOpenRectify(item)) continue;
+      const next: RectifyRow = { ...item, state: 'recheck' };
+      if (elevatorChanged) {
+        next.elevatorId = row.elevatorId;
+        next.dedupeKey = rectifyDedupeKey(row.elevatorId, item.item);
+      }
+      await db.rectifies.put(next);
+    }
+  });
+}
+
+/** 删除计划并级联删除保养项；来源随之作废的未复核整改单回到待复核 */
 export async function removePlan(id: string): Promise<void> {
-  await db.transaction('rw', [db.plans, db.checkItems], async () => {
+  await db.transaction('rw', [db.plans, db.checkItems, db.rectifies], async () => {
+    const items = await db.checkItems.where('planId').equals(id).toArray();
+    const voidedIds = items.filter((row) => isAbnormal(row.result)).map((row) => row.id);
     await db.checkItems.where('planId').equals(id).delete();
     await db.plans.delete(id);
+    const linked = await db.rectifies.where('sourcePlanId').equals(id).toArray();
+    const byItems =
+      voidedIds.length > 0
+        ? await db.rectifies.where('sourceItemId').anyOf(voidedIds).toArray()
+        : [];
+    await recheckOpenRectifies([...linked, ...byItems]);
   });
 }
 
@@ -427,8 +531,47 @@ export async function putCheckItems(rows: CheckItemRow[]): Promise<void> {
   await db.checkItems.bulkPut(rows);
 }
 
-export async function removeCheckItem(id: string): Promise<void> {
-  await db.checkItems.delete(id);
+/**
+ * 批量保存保养项并联动整改单（一次本地事务）：
+ * 结果由异常 / 建议改为非异常的项视为作废，其未复核整改单回到待复核；
+ * 返回退回待复核的整改单数。
+ */
+export async function putCheckItemsWithSync(rows: CheckItemRow[]): Promise<number> {
+  if (rows.length === 0) return 0;
+  return db.transaction('rw', [db.checkItems, db.rectifies], async () => {
+    const oldRows = await db.checkItems
+      .where('id')
+      .anyOf(rows.map((row) => row.id))
+      .toArray();
+    const oldById = new Map(oldRows.map((row) => [row.id, row]));
+    const voidedIds: string[] = [];
+    for (const row of rows) {
+      const before = oldById.get(row.id);
+      if (before && isAbnormal(before.result) && !isAbnormal(row.result)) voidedIds.push(row.id);
+    }
+    await db.checkItems.bulkPut(rows);
+    return recheckRectifiesOfItems(voidedIds);
+  });
+}
+
+/** 删除保养项并联动：被删的异常项，其未复核整改单回到待复核 */
+export async function removeCheckItemWithSync(id: string): Promise<void> {
+  await db.transaction('rw', [db.checkItems, db.rectifies], async () => {
+    const before = await db.checkItems.get(id);
+    await db.checkItems.delete(id);
+    if (before && isAbnormal(before.result)) await recheckRectifiesOfItems([id]);
+  });
+}
+
+/** 重置某计划的保养项清单并联动：被清掉的异常项，其未复核整改单回到待复核 */
+export async function replacePlanCheckItems(planId: string, rows: CheckItemRow[]): Promise<void> {
+  await db.transaction('rw', [db.checkItems, db.rectifies], async () => {
+    const oldRows = await db.checkItems.where('planId').equals(planId).toArray();
+    const voidedIds = oldRows.filter((row) => isAbnormal(row.result)).map((row) => row.id);
+    await db.checkItems.where('planId').equals(planId).delete();
+    await db.checkItems.bulkPut(rows);
+    await recheckRectifiesOfItems(voidedIds);
+  });
 }
 
 /* ============================ 困人事件 ============================ */
@@ -448,9 +591,10 @@ export async function removeRescue(id: string): Promise<void> {
 
 /* ============================= 整改单 ============================= */
 
+/** 列表与导出只按主单展示：已归并到他单的重复单（mergedInto 非空）不出现在查询结果 */
 export async function listRectifies(): Promise<RectifyRow[]> {
   const rows = await db.rectifies.toArray();
-  return rows.sort((a, b) => a.dueDate.localeCompare(b.dueDate));
+  return rows.filter((row) => isMasterRectify(row)).sort((a, b) => a.dueDate.localeCompare(b.dueDate));
 }
 
 export async function putRectify(row: RectifyRow): Promise<void> {
@@ -459,6 +603,197 @@ export async function putRectify(row: RectifyRow): Promise<void> {
 
 export async function removeRectify(id: string): Promise<void> {
   await db.rectifies.delete(id);
+}
+
+/** 同事务内查有效整改单（主单且未复核关闭） */
+async function findOpenRectify(dedupeKey: string): Promise<RectifyRow | undefined> {
+  const rows = await db.rectifies.where('dedupeKey').equals(dedupeKey).toArray();
+  return rows.find((row) => isOpenRectify(row));
+}
+
+/** 同事务内把给定整改单中未复核的退回待复核（已复核结论照旧保留），返回影响条数 */
+async function recheckOpenRectifies(rows: RectifyRow[]): Promise<number> {
+  let count = 0;
+  const seen = new Set<string>();
+  for (const row of rows) {
+    if (seen.has(row.id)) continue;
+    seen.add(row.id);
+    if (!isOpenRectify(row) || row.state === 'recheck') continue;
+    await db.rectifies.put({ ...row, state: 'recheck' });
+    count += 1;
+  }
+  return count;
+}
+
+/** 同事务内把来源保养项已作废的未复核整改单退回待复核 */
+async function recheckRectifiesOfItems(itemIds: string[]): Promise<number> {
+  if (itemIds.length === 0) return 0;
+  const rows = await db.rectifies.where('sourceItemId').anyOf(itemIds).toArray();
+  return recheckOpenRectifies(rows);
+}
+
+/** 构造一条新整改单（主单，带去重键与来源） */
+function buildRectifyRow(input: {
+  elevatorId: string;
+  item: string;
+  dueDate: string;
+  reviewer: string;
+  sourcePlanId: string | null;
+  sourceItemId: string | null;
+}): RectifyRow {
+  return {
+    id: uuid(),
+    elevatorId: input.elevatorId,
+    item: input.item.trim(),
+    dueDate: input.dueDate,
+    state: 'pending',
+    reviewer: input.reviewer.trim(),
+    reviewedAt: null,
+    dedupeKey: rectifyDedupeKey(input.elevatorId, input.item),
+    sourcePlanId: input.sourcePlanId,
+    sourceItemId: input.sourceItemId,
+    mergedInto: null,
+    mergedFrom: [],
+    createdAt: nowDateTime(),
+    revision: ROW_REVISION,
+  };
+}
+
+export interface RectifyCreateInput {
+  elevatorId: string;
+  item: string;
+  dueDate: string;
+  reviewer: string;
+  sourcePlanId?: string | null;
+  sourceItemId?: string | null;
+}
+
+export interface RectifyCreateResult {
+  row: RectifyRow;
+  /** true 表示已存在有效单，本次复用而未新建 */
+  reused: boolean;
+}
+
+/**
+ * 幂等登记整改单（独立本地事务）：
+ * 同一电梯同一不合格项只留一条有效单；已存在有效单（未归并且未复核关闭）时
+ * 直接返回该单，重复提交 / 双终端并发不产生新单。
+ */
+export async function createRectifyIdempotent(input: RectifyCreateInput): Promise<RectifyCreateResult> {
+  return db.transaction('rw', db.rectifies, async () => {
+    const key = rectifyDedupeKey(input.elevatorId, input.item);
+    const existing = await findOpenRectify(key);
+    if (existing) return { row: existing, reused: true };
+    const row = buildRectifyRow({
+      elevatorId: input.elevatorId,
+      item: input.item,
+      dueDate: input.dueDate,
+      reviewer: input.reviewer,
+      sourcePlanId: input.sourcePlanId ?? null,
+      sourceItemId: input.sourceItemId ?? null,
+    });
+    await db.rectifies.add(row);
+    return { row, reused: false };
+  });
+}
+
+/* ==================== 保养执行事务（保养项 + 计划 + 整改单） ==================== */
+
+export interface PlanExecutionInput {
+  planId: string;
+  /** 待落库的保养项（空数组表示本次不改动保养项） */
+  items: CheckItemRow[];
+  /** 是否同事务签署计划（校验未填项，失败则整体回滚） */
+  sign: boolean;
+  /** 异常项转整改参数；null 表示本次不转 */
+  rectify: { dueDate: string; reviewer: string } | null;
+}
+
+export interface PlanExecutionResult {
+  /** 本次落库的保养项数 */
+  savedItems: number;
+  /** 本次是否完成签署 */
+  signed: boolean;
+  /** 新建的整改单 */
+  createdRectifies: RectifyRow[];
+  /** 重复提交时复用的已有有效单 */
+  reusedRectifies: RectifyRow[];
+  /** 因异常项作废回到待复核的整改单数 */
+  recheckedCount: number;
+}
+
+/**
+ * 保养执行一次本地事务：保养项落库、计划签署、异常项转整改要么全部生效，要么整体回滚。
+ * - 同一异常只留一条有效整改单：事务内按去重键查有效单，重复提交返回已有单；
+ * - 写入失败后签署草稿与已完成项不落库也不丢失，重试按去重键幂等，不重复建单；
+ * - 异常项作废（结果改回非异常）时，未复核整改单回到待复核，已复核结论照旧保留。
+ */
+export async function commitPlanExecution(input: PlanExecutionInput): Promise<PlanExecutionResult> {
+  return db.transaction('rw', [db.plans, db.checkItems, db.rectifies], async () => {
+    const plan = await db.plans.get(input.planId);
+    if (!plan) throw new Error('计划不存在或已被删除');
+
+    // 1) 保养项落库；结果由异常改为非异常的项，联动其未复核整改单回待复核
+    let recheckedCount = 0;
+    if (input.items.length > 0) {
+      const oldRows = await db.checkItems
+        .where('id')
+        .anyOf(input.items.map((row) => row.id))
+        .toArray();
+      const oldById = new Map(oldRows.map((row) => [row.id, row]));
+      const voidedIds: string[] = [];
+      for (const row of input.items) {
+        const before = oldById.get(row.id);
+        if (before && isAbnormal(before.result) && !isAbnormal(row.result)) voidedIds.push(row.id);
+      }
+      await db.checkItems.bulkPut(input.items);
+      recheckedCount = await recheckRectifiesOfItems(voidedIds);
+    }
+
+    // 2) 签署计划：基于落库后的全量保养项校验，未填项则抛错回滚整个事务
+    let signed = false;
+    if (input.sign) {
+      const all = await db.checkItems.where('planId').equals(input.planId).toArray();
+      if (all.length === 0) throw new Error('该计划没有保养项，无法签署');
+      const unfilled = all.filter((row) => row.result === null);
+      if (unfilled.length > 0) throw new Error(`还有 ${unfilled.length} 项未填写结果，无法签署`);
+      await db.plans.put({ ...plan, state: 'signed', signedAt: nowDateTime() });
+      signed = true;
+    }
+
+    // 3) 异常项转整改：同一异常只留一条有效单，重复提交复用已有单
+    const createdRectifies: RectifyRow[] = [];
+    const reusedRectifies: RectifyRow[] = [];
+    if (input.rectify) {
+      const all = await db.checkItems.where('planId').equals(input.planId).toArray();
+      for (const item of all.filter((row) => isAbnormal(row.result))) {
+        const key = rectifyDedupeKey(plan.elevatorId, item.itemName);
+        const existing = await findOpenRectify(key);
+        if (existing) {
+          reusedRectifies.push(existing);
+          continue;
+        }
+        const row = buildRectifyRow({
+          elevatorId: plan.elevatorId,
+          item: item.itemName,
+          dueDate: input.rectify.dueDate,
+          reviewer: input.rectify.reviewer,
+          sourcePlanId: plan.id,
+          sourceItemId: item.id,
+        });
+        await db.rectifies.add(row);
+        createdRectifies.push(row);
+      }
+    }
+
+    return {
+      savedItems: input.items.length,
+      signed,
+      createdRectifies,
+      reusedRectifies,
+      recheckedCount,
+    };
+  });
 }
 
 /* ========================== 整库导入导出 ========================== */
@@ -495,6 +830,13 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
 }
 
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
+  // 旧版备份的整改单先补齐去重键 / 来源字段，再按主单归并重复单（与结构迁移同口径）
+  const rectifies = mergeDuplicateRectifies(
+    (snapshot.rectifies ?? []).map((row) => ({
+      ...normalizeRectifyRow(row),
+      createdAt: row.createdAt || nowDateTime(),
+    })),
+  );
   await db.transaction(
     'rw',
     [db.elevators, db.plans, db.checkItems, db.rescues, db.rectifies],
@@ -510,7 +852,7 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
       await db.plans.bulkPut(snapshot.plans ?? []);
       await db.checkItems.bulkPut(snapshot.checkItems ?? []);
       await db.rescues.bulkPut(snapshot.rescues ?? []);
-      await db.rectifies.bulkPut(snapshot.rectifies ?? []);
+      await db.rectifies.bulkPut(rectifies);
     },
   );
 }
