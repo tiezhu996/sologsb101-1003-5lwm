@@ -20,7 +20,7 @@ import {
 } from '../utils/db';
 import type { ElevatorDraft, ElevatorView } from '../types/elevator';
 import { isPlanOverdue } from '../types/plan';
-import { overdueDaysOf } from '../types/rectify';
+import { isMasterRectify, overdueDaysOf } from '../types/rectify';
 import { rescueMinutes } from '../utils/duration';
 import { nextPlanDate } from '../utils/cycle';
 import { nowDateTime } from '../utils/duration';
@@ -146,8 +146,10 @@ export const useElevatorStore = defineStore('elevator', () => {
       const ownedPlans = plans.value.filter((item) => item.elevatorId === elevator.id);
       const overduePlanCount = ownedPlans.filter((item) => isPlanOverdue(item)).length;
       const pendingRectifyCount = rectifies.value.filter((item) => {
+        if (!isMasterRectify(item)) return false;
         if (item.elevatorId !== elevator.id) return false;
-        return item.state === 'pending' && overdueDaysOf(item.dueDate, item.state) >= 0;
+        // 未闭环（待整改 / 待复核）计数；超期天数只对待整改单有意义
+        return item.state !== 'reviewed' && overdueDaysOf(item.dueDate, item.state) >= 0;
       }).length;
       const ownedRescues = rescues.value
         .filter((item) => item.elevatorId === elevator.id)
@@ -170,7 +172,10 @@ export const useElevatorStore = defineStore('elevator', () => {
   );
 
   const pendingRectifyTotal = computed(
-    () => rectifies.value.filter((item) => item.state === 'pending').length,
+    () =>
+      rectifies.value.filter(
+        (item) => isMasterRectify(item) && item.state !== 'reviewed',
+      ).length,
   );
 
   return {

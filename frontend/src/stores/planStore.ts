@@ -6,6 +6,7 @@ import { computed, ref } from 'vue';
 import { defineStore } from 'pinia';
 import {
   ROW_REVISION,
+  db,
   listCheckItems,
   listElevators,
   listPlans,
@@ -19,8 +20,10 @@ import {
   type PlanRow,
 } from '../utils/db';
 import { itemsForCycle } from '../types/checkItem';
+import type { CheckItemDraft } from '../types/checkItem';
 import { isPlanOverdue, planProgress, type PlanDraft, type PlanState, type PlanView } from '../types/plan';
 import type { MaintCycle } from '../types/elevator';
+import { changePlanTx, signPlanTx } from '../utils/workflow';
 import { nowDateTime, todayDate } from '../utils/duration';
 import { uuid } from '../utils/export';
 import { emitChange, onChange } from '../utils/events';
@@ -93,7 +96,7 @@ export const usePlanStore = defineStore('plan', () => {
     activePlanId.value = id;
   }
 
-  /** 为指定电梯生成一期计划（同时生成保养项清单） */
+  /** 为指定电梯生成一期计划（计划与保养项同一事务提交） */
   async function createPlan(draft: PlanDraft): Promise<PlanRow> {
     const row: PlanRow = {
       id: uuid(),
@@ -106,25 +109,26 @@ export const usePlanStore = defineStore('plan', () => {
       createdAt: nowDateTime(),
       revision: ROW_REVISION,
     };
-    await putPlan(row);
-    await putCheckItems(
-      itemsForCycle(row.cycleType).map((itemName, index) => ({
-        id: `chk-${row.id}-${index + 1}`,
-        planId: row.id,
-        seq: index + 1,
-        itemName,
-        result: null,
-        value: '',
-        remark: '',
-        createdAt: nowDateTime(),
-        revision: ROW_REVISION,
-      })),
-    );
+    const itemRows: CheckItemRow[] = itemsForCycle(row.cycleType).map((itemName, index) => ({
+      id: `chk-${row.id}-${index + 1}`,
+      planId: row.id,
+      seq: index + 1,
+      itemName,
+      result: null,
+      value: '',
+      remark: '',
+      createdAt: nowDateTime(),
+      revision: ROW_REVISION,
+    }));
+    await db.transaction('rw', [db.plans, db.checkItems], async () => {
+      await putPlan(row);
+      await putCheckItems(itemRows);
+    });
     emitChange();
     return row;
   }
 
-  /** 按周期批量生成计划（多电梯 × 多期） */
+  /** 按周期批量生成计划（计划与保养项同一事务提交，失败整体回滚） */
   async function batchGenerate(input: BatchGenerateInput): Promise<number> {
     const rows: PlanRow[] = [];
     const items: CheckItemRow[] = [];
@@ -132,6 +136,7 @@ export const usePlanStore = defineStore('plan', () => {
       const dates = planDatesFrom(input.startDate, input.cycleType, input.periods);
       for (const planDate of dates) {
         const id = uuid();
+        const stamp = nowDateTime();
         rows.push({
           id,
           elevatorId,
@@ -140,7 +145,7 @@ export const usePlanStore = defineStore('plan', () => {
           executor: input.executor.trim(),
           state: 'pending',
           signedAt: null,
-          createdAt: nowDateTime(),
+          createdAt: stamp,
           revision: ROW_REVISION,
         });
         items.push(
@@ -152,30 +157,29 @@ export const usePlanStore = defineStore('plan', () => {
             result: null,
             value: '',
             remark: '',
-            createdAt: nowDateTime(),
+            createdAt: stamp,
             revision: ROW_REVISION,
           })),
         );
       }
     }
     if (rows.length === 0) return 0;
-    await putPlans(rows);
-    await putCheckItems(items);
+    await db.transaction('rw', [db.plans, db.checkItems], async () => {
+      await putPlans(rows);
+      await putCheckItems(items);
+    });
     emitChange();
     return rows.length;
   }
 
-  async function updatePlan(id: string, draft: PlanDraft): Promise<void> {
-    const existing = plans.value.find((item) => item.id === id);
-    if (!existing) return;
-    await putPlan({
-      ...existing,
-      elevatorId: draft.elevatorId,
-      cycleType: draft.cycleType,
-      planDate: draft.planDate,
-      executor: draft.executor.trim(),
-    });
+  /**
+   * 改期 / 更换电梯 / 调整计划（同一事务）。
+   * 改期或换梯后，该计划来源的未复核整改单回到待复核；已复核结论保留。
+   */
+  async function updatePlan(id: string, draft: PlanDraft): Promise<{ reopenedCount: number }> {
+    const result = await changePlanTx(id, draft);
     emitChange();
+    return { reopenedCount: result?.reopened.length ?? 0 };
   }
 
   /** 指派执行人 */
@@ -198,19 +202,36 @@ export const usePlanStore = defineStore('plan', () => {
     emitChange();
   }
 
-  /** 签署：要求全部保养项已填写结果 */
-  async function signPlan(id: string): Promise<{ ok: boolean; message: string }> {
-    const existing = plans.value.find((item) => item.id === id);
-    if (!existing) return { ok: false, message: '计划不存在' };
-    const items = checkItems.value.filter((item) => item.planId === id);
-    const unfilled = items.filter((item) => item.result === null);
-    if (items.length === 0) return { ok: false, message: '该计划没有保养项' };
-    if (unfilled.length > 0) {
-      return { ok: false, message: `还有 ${unfilled.length} 项未填写结果，无法签署` };
+  /**
+   * 签署：保养项保存与计划签署在同一本地事务。
+   * - 可传入当前页面草稿，签署前一次性落库；
+   * - 未全部填写 / 没有保养项时事务回滚，已保存项与签署草稿均可恢复，重试不产生重复数据。
+   */
+  async function signPlan(
+    id: string,
+    drafts?: Array<{ id: string } & CheckItemDraft>,
+  ): Promise<{ ok: boolean; message: string; reopenedCount: number }> {
+    try {
+      const result = await signPlanTx(
+        id,
+        drafts?.map((draft) => ({
+          id: draft.id,
+          itemName: draft.itemName,
+          result: draft.result,
+          value: draft.value,
+          remark: draft.remark,
+        })),
+      );
+      emitChange();
+      return { ok: result.ok, message: result.message, reopenedCount: result.reopened.length };
+    } catch (cause) {
+      // 校验失败由事务整体回滚：计划不会签署，保养项也不落半成品
+      return {
+        ok: false,
+        message: cause instanceof Error ? cause.message : '签署失败，已恢复未签署状态',
+        reopenedCount: 0,
+      };
     }
-    await putPlan({ ...existing, state: 'signed', signedAt: nowDateTime() });
-    emitChange();
-    return { ok: true, message: '签署完成' };
   }
 
   async function deletePlan(id: string): Promise<void> {

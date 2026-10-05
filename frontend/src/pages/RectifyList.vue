@@ -183,17 +183,52 @@ async function handleReset(): Promise<void> {
 }
 
 function exportOverdueCsv(): void {
-  const rows: Array<Array<string | number>> = [['电梯', '不合格项', '限期', '状态', '超期天数', '复核人']];
+  // CSV 导出只按主单口径展示；归并来源数列留痕旧重复单
+  const rows: Array<Array<string | number>> = [
+    ['电梯', '不合格项', '限期', '状态', '超期天数', '复核人', '归并来源单数'],
+  ];
   for (const row of rectifyStore.rectifyViews) {
-    rows.push([row.elevatorName, row.item, row.dueDate, RECTIFY_STATE_LABEL[row.state], row.overdueDays, row.reviewer]);
+    rows.push([
+      row.elevatorName,
+      row.item,
+      row.dueDate,
+      RECTIFY_STATE_LABEL[row.state],
+      row.overdueDays,
+      row.reviewer,
+      row.mergedCount,
+    ]);
   }
   downloadCsv(`gbelevsvc-rectify-${todayDate()}.csv`, rows);
-  message.success('整改清单已导出 CSV');
+  message.success('整改清单（主单口径）已导出 CSV');
 }
 
 const columns = computed<DataTableColumns<RectifyView>>(() => [
   { title: '电梯', key: 'elevatorName', minWidth: 210, ellipsis: { tooltip: true } },
-  { title: '不合格项', key: 'item', minWidth: 180 },
+  {
+    title: '不合格项',
+    key: 'item',
+    minWidth: 180,
+    render: (row) =>
+      h(NSpace, { size: 6, align: 'center' }, {
+        default: () => [
+          h('span', row.item),
+          row.mergedCount > 0
+            ? h(
+                NTag,
+                {
+                  size: 'small',
+                  type: 'warning',
+                  round: true,
+                  title: `已归并 ${row.mergedCount} 条历史重复单，来源：${(row.mergedFrom ?? [])
+                    .map((source) => source.id)
+                    .join('、')}`,
+                },
+                { default: () => `归并 ${row.mergedCount} 单` },
+              )
+            : null,
+        ],
+      }),
+  },
   { title: '限期', key: 'dueDate', width: 120 },
   {
     title: '状态',
@@ -211,12 +246,27 @@ const columns = computed<DataTableColumns<RectifyView>>(() => [
   {
     title: '操作',
     key: 'actions',
-    width: 210,
+    width: 250,
     fixed: 'right',
     render: (row) =>
       h(NSpace, { size: 2 }, {
         default: () => [
           row.state === 'pending'
+            ? h(
+                NButton,
+                {
+                  size: 'tiny',
+                  text: true,
+                  type: 'info',
+                  onClick: async () => {
+                    await rectifyStore.submitForReview(row.id, row.reviewer);
+                    message.success('整改结果已提交，进入待复核队列');
+                  },
+                },
+                { default: () => '提交复核' },
+              )
+            : null,
+          row.state === 'reviewing'
             ? h(
                 NButton,
                 {
@@ -230,7 +280,24 @@ const columns = computed<DataTableColumns<RectifyView>>(() => [
                 },
                 { default: () => '复核通过' },
               )
-            : h(
+            : null,
+          row.state === 'reviewing'
+            ? h(
+                NButton,
+                {
+                  size: 'tiny',
+                  text: true,
+                  type: 'warning',
+                  onClick: async () => {
+                    await rectifyStore.rejectToPending(row.id);
+                    message.info('复核不通过，已退回待整改');
+                  },
+                },
+                { default: () => '退回整改' },
+              )
+            : null,
+          row.state === 'reviewed'
+            ? h(
                 NButton,
                 {
                   size: 'tiny',
@@ -238,11 +305,12 @@ const columns = computed<DataTableColumns<RectifyView>>(() => [
                   type: 'warning',
                   onClick: async () => {
                     await rectifyStore.revokeReview(row.id);
-                    message.info('已退回待整改');
+                    message.info('已撤销复核，回到待复核队列');
                   },
                 },
                 { default: () => '撤销复核' },
-              ),
+              )
+            : null,
           h(NButton, { size: 'tiny', text: true, onClick: () => openEdit(row) }, { default: () => '编辑' }),
           h(
             NButton,
@@ -252,7 +320,9 @@ const columns = computed<DataTableColumns<RectifyView>>(() => [
               type: 'error',
               onClick: async () => {
                 await rectifyStore.deleteRectify(row.id);
-                message.success('整改单已删除');
+                message.success(
+                  row.mergedCount > 0 ? `主单及归并的 ${row.mergedCount} 条历史重复单已删除` : '整改单已删除',
+                );
               },
             },
             { default: () => '删除' },
@@ -293,13 +363,20 @@ const columns = computed<DataTableColumns<RectifyView>>(() => [
     </div>
 
     <div class="stat-grid">
-      <stat-badge title="整改单总数" :value="rectifyStore.rectifyViews.length" suffix="条" color="#18a058" />
+      <stat-badge title="有效整改单" :value="rectifyStore.rectifyViews.length" suffix="条" color="#18a058" hint="主单口径，历史重复单已归并留痕" />
       <stat-badge
         title="待整改"
         :value="rectifyStore.pendingViews.length"
         suffix="条"
         color="#f0a020"
-        hint="未复核关闭的整改项"
+        hint="班组尚未提交整改结果"
+      />
+      <stat-badge
+        title="待复核"
+        :value="rectifyStore.reviewingViews.length"
+        suffix="条"
+        color="#2080f0"
+        hint="已提交整改或源头变更后等待复核确认"
       />
       <stat-badge
         title="超期预警"
@@ -317,7 +394,7 @@ const columns = computed<DataTableColumns<RectifyView>>(() => [
         :value="rectifyStore.reviewRate"
         suffix="%"
         :percent="rectifyStore.reviewRate"
-        color="#2080f0"
+        color="#18a058"
       />
     </div>
 
@@ -329,6 +406,7 @@ const columns = computed<DataTableColumns<RectifyView>>(() => [
           label: '状态',
           options: [
             { label: '待整改', value: 'pending' },
+            { label: '待复核', value: 'reviewing' },
             { label: '已复核', value: 'reviewed' },
           ],
           width: 180,

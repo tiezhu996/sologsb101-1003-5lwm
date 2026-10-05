@@ -153,15 +153,23 @@ async function fillRest(): Promise<void> {
   message.success(`已将其余 ${rest.length} 项标为正常`);
 }
 
-/** 签署：先保存再校验 */
+/** 签署：保养项草稿与计划签署在同一本地事务提交，失败整体回滚可重试 */
 async function signPlan(): Promise<void> {
-  await saveAll();
-  const result = await planStore.signPlan(planId.value);
+  const payload = items.value.map((item) => ({
+    id: item.id,
+    ...(drafts.value[item.id] ?? {
+      itemName: item.itemName,
+      result: item.result,
+      value: item.value,
+      remark: item.remark,
+    }),
+  }));
+  const result = await planStore.signPlan(planId.value, payload);
   if (result.ok) message.success('保养计划已签署');
   else message.warning(result.message);
 }
 
-/** 异常项一键转整改 */
+/** 异常项一键转整改（同事务；同一异常重复提交返回已有单，不重复建单） */
 async function promote(): Promise<void> {
   if (!plan.value) return;
   if (abnormalDrafts.value.length === 0) {
@@ -171,10 +179,32 @@ async function promote(): Promise<void> {
   const date = new Date(rectifyDueTs.value);
   const pad = (value: number): string => String(value).padStart(2, '0');
   const dueDate = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
-  await saveAll();
-  const created = await rectifyStore.promoteAbnormalItems(plan.value.elevatorId, planId.value, dueDate, reviewer.value);
-  if (created === 0) message.info('异常项均已有待整改单，未重复生成');
-  else message.success(`已生成 ${created} 条年检整改单`);
+  // 保存草稿与转整改在同一本地事务：要么全部生效，要么全部回滚
+  const payload = items.value.map((item) => ({
+    id: item.id,
+    ...(drafts.value[item.id] ?? {
+      itemName: item.itemName,
+      result: item.result,
+      value: item.value,
+      remark: item.remark,
+    }),
+  }));
+  const summary = await rectifyStore.promoteAbnormalItems(
+    plan.value.elevatorId,
+    planId.value,
+    dueDate,
+    reviewer.value,
+    payload,
+  );
+  if (summary.created.length === 0 && summary.reused.length > 0) {
+    message.info(`异常项均已存在整改单，返回已有 ${summary.reused.length} 条，未重复生成`);
+  } else if (summary.reused.length > 0) {
+    message.success(
+      `新建 ${summary.created.length} 条整改单，${summary.reused.length} 条异常已有单已直接返回`,
+    );
+  } else {
+    message.success(`已生成 ${summary.created.length} 条年检整改单`);
+  }
 }
 
 const elevatorRemind = computed(() => {

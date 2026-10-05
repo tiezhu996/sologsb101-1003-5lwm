@@ -34,6 +34,7 @@ const PLAN_TONE: Record<PlanState, TagTone> = {
 
 const RECTIFY_TONE: Record<RectifyState, TagTone> = {
   pending: 'warning',
+  reviewing: 'info',
   reviewed: 'success',
 };
 

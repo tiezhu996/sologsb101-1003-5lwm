@@ -20,7 +20,7 @@ import { nowDateTime, rescueMinutes, todayDate } from './duration';
 export const DB_NAME = 'gbelevsvc';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 export { ROW_REVISION };
 export type { Revisioned };
@@ -88,10 +88,162 @@ class ElevatorServiceDatabase extends Dexie {
           if (row.result === undefined) row.result = null;
         });
       });
+
+    // v3：整改单防重与复核回流
+    //   - rectifies 新增唯一索引 &sourceItemId：同一异常项只允许一条有效整改单，
+    //     并发双提交由 IndexedDB 唯一约束在事务层面拒绝
+    //   - 新增 masterId / mergedFrom：历史重复单归并为主单 + 从单（留来源），
+    //     列表与导出只展示主单
+    //   - 整改状态新增 reviewing（待复核）
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        elevators: 'id, regCode, owner, maintCycle, useDate',
+        plans: 'id, elevatorId, cycleType, state, planDate, executor, [elevatorId+planDate]',
+        checkItems: 'id, planId, seq, result, itemName, [planId+seq]',
+        rescues: 'id, elevatorId, alarmAt, responder',
+        rectifies:
+          'id, elevatorId, state, dueDate, reviewer, masterId, &sourceItemId',
+        settings: 'id',
+      })
+      .upgrade(async (tx) => {
+        await tx.table('rectifies').toCollection().modify((row: Record<string, unknown>) => {
+          row.revision = ROW_REVISION;
+        });
+        // 历史重复整改单归并：主单保留、从单留痕
+        await normalizeRectifyRows(tx.table('rectifies'));
+      });
   }
 }
 
 export const db = new ElevatorServiceDatabase();
+
+/* ====================== 整改单归并（迁移 / 导入共用） ====================== */
+
+interface RectifyNormalizeRow {
+  id?: unknown;
+  masterId?: unknown;
+  sourceItemId?: unknown;
+  state?: unknown;
+  reviewer?: unknown;
+  reviewedAt?: unknown;
+  revision?: unknown;
+  mergedFrom?: unknown;
+  [key: string]: unknown;
+}
+
+/** 主单挑选优先级：已复核 > 待复核 > 待整改；同状态取创建最早、id 最小 */
+const STATE_PICK_RANK: Record<string, number> = { reviewed: 0, reviewing: 1, pending: 2 };
+
+interface StoredMergeSource {
+  id: string;
+  state: string;
+  reviewer: string;
+  dueDate: string;
+  createdAt: string;
+  mergedAt: string;
+}
+
+/**
+ * 归一化整改单（行以宽松结构读写，兼容 v1/v2 历史数据）：
+ * 1. 补齐 masterId（主单指向自身）、revision；
+ * 2. 把历史重复单（v3 之前并发双提交产生）按「来源保养项」或
+ *    「电梯 + 不合格项 + 限期」归并：保留一条主单，其余转从单并写入 mergedFrom 来源；
+ * 3. 从单清除 sourceItemId，避免唯一索引冲突，仅留痕、不参与列表与导出。
+ * 已是 v3 结构（带 masterId）的行原样保留，保证重复执行 / 导入幂等。
+ */
+export async function normalizeRectifyRows(
+  table: Pick<Table<RectifyRow, string>, 'toArray' | 'bulkPut'>,
+): Promise<void> {
+  const rows = (await table.toArray()) as unknown as RectifyNormalizeRow[];
+  const touched: RectifyNormalizeRow[] = [];
+  const flush = async (): Promise<void> => {
+    if (touched.length === 0) return;
+    await table.bulkPut(touched as unknown as RectifyRow[]);
+    touched.length = 0;
+  };
+
+  /** 已经归并过（v3 导出再导入）的行：仅保证从单不占唯一索引 */
+  for (const row of rows) {
+    if (typeof row.masterId === 'string' && row.masterId !== row.id) {
+      if (row.sourceItemId !== undefined) {
+        delete row.sourceItemId;
+        touched.push(row);
+      }
+    }
+  }
+
+  const pending = rows.filter((row) => typeof row.masterId !== 'string');
+  if (pending.length === 0) {
+    await flush();
+    return;
+  }
+
+  const groups = new Map<string, RectifyNormalizeRow[]>();
+  for (const row of pending) {
+    const key =
+      typeof row.sourceItemId === 'string' && row.sourceItemId
+        ? `src:${row.sourceItemId}`
+        : `manual:${String(row.elevatorId)}|${String(row.item)}|${String(row.dueDate)}`;
+    const list = groups.get(key);
+    if (list) list.push(row);
+    else groups.set(key, [row]);
+  }
+
+  const stamp = nowDateTime();
+  for (const group of groups.values()) {
+    for (const row of group) {
+      if (typeof row.reviewer !== 'string') row.reviewer = '';
+      if (row.state !== 'pending' && row.state !== 'reviewing' && row.state !== 'reviewed') {
+        row.state = 'pending';
+      }
+      row.revision = ROW_REVISION;
+    }
+    if (group.length === 1) {
+      group[0].masterId = group[0].id;
+      touched.push(group[0]);
+      continue;
+    }
+    const master = [...group].sort((a, b) => {
+      const rankDiff =
+        (STATE_PICK_RANK[String(a.state)] ?? 3) - (STATE_PICK_RANK[String(b.state)] ?? 3);
+      if (rankDiff !== 0) return rankDiff;
+      const timeDiff = String(a.createdAt ?? '').localeCompare(String(b.createdAt ?? ''));
+      if (timeDiff !== 0) return timeDiff;
+      return String(a.id).localeCompare(String(b.id));
+    })[0];
+
+    const previousMerged: StoredMergeSource[] = Array.isArray(master.mergedFrom)
+      ? (master.mergedFrom as StoredMergeSource[])
+      : [];
+    for (const alias of group) {
+      if (alias === master) continue;
+      previousMerged.push({
+        id: String(alias.id),
+        state: String(alias.state),
+        reviewer: String(alias.reviewer ?? ''),
+        dueDate: String(alias.dueDate ?? ''),
+        createdAt: String(alias.createdAt ?? ''),
+        mergedAt: stamp,
+      });
+      alias.masterId = master.id;
+      // 从单不再占「同一异常一条有效单」的唯一槽位
+      if (alias.sourceItemId !== undefined) delete alias.sourceItemId;
+      touched.push(alias);
+    }
+    // 组内只要有一单已复核，复核结论照旧保留到主单
+    const reviewedOne = group.find((row) => row.state === 'reviewed');
+    if (reviewedOne && master.state !== 'reviewed') {
+      master.state = 'reviewed';
+      master.reviewer = reviewedOne.reviewer;
+      master.reviewedAt = reviewedOne.reviewedAt ?? null;
+    }
+    master.masterId = master.id;
+    master.mergedFrom = previousMerged;
+    touched.push(master);
+  }
+
+  await flush();
+}
 
 /* ============================== 演示数据播种 ============================== */
 
@@ -188,7 +340,7 @@ const SEED_ELEVATORS: SeedElevatorSpec[] = [
       },
     ],
     rectifies: [
-      { item: '制动器制动力矩不足', dueOffsetDays: 8, state: 'pending', reviewer: '王敏' },
+      { item: '制动器制动力矩不足', dueOffsetDays: 8, state: 'reviewing', reviewer: '王敏' },
     ],
   },
   {
@@ -324,6 +476,8 @@ async function seedDatabase(): Promise<void> {
         state: rectifySpec.state,
         reviewer: rectifySpec.reviewer,
         reviewedAt: rectifySpec.state === 'reviewed' ? `${addDays(todayDate(), -3)} 10:30` : null,
+        // 播种的整改单各自为主单（不绑定 sourceItemId，手工登记口径）
+        masterId: `rect-${elevatorIndex + 1}-${rectifyIndex + 1}`,
         createdAt: stamp,
         revision: ROW_REVISION,
       });
@@ -453,6 +607,17 @@ export async function listRectifies(): Promise<RectifyRow[]> {
   return rows.sort((a, b) => a.dueDate.localeCompare(b.dueDate));
 }
 
+/**
+ * 主单口径查询：归并后的从单（历史重复单留痕）不参与列表 / 导出 / 统计。
+ * 全量行（含从单）仍可通过 listRectifies() 取得，供 JSON 存档。
+ */
+export async function listMasterRectifies(): Promise<RectifyRow[]> {
+  const rows = await db.rectifies.toArray();
+  return rows
+    .filter((row) => !row.masterId || row.masterId === row.id)
+    .sort((a, b) => a.dueDate.localeCompare(b.dueDate));
+}
+
 export async function putRectify(row: RectifyRow): Promise<void> {
   await db.rectifies.put(row);
 }
@@ -511,6 +676,8 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
       await db.checkItems.bulkPut(snapshot.checkItems ?? []);
       await db.rescues.bulkPut(snapshot.rescues ?? []);
       await db.rectifies.bulkPut(snapshot.rectifies ?? []);
+      // 导入旧版本 / 含重复单的备份时同样归并，保证唯一索引与主单口径成立
+      await normalizeRectifyRows(db.rectifies);
     },
   );
 }

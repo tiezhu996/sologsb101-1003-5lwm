@@ -84,13 +84,14 @@ sologsb101-1003/
         ├── hooks/               # usePlanProgress.ts useIdbTable.ts
         ├── pages/               # ElevatorList.vue PlanList.vue PlanExecute.vue RescueTimeline.vue RectifyList.vue
         ├── router/index.ts
-        └── utils/               # duration.ts cycle.ts db.ts export.ts events.ts
+        └── utils/               # duration.ts cycle.ts db.ts export.ts events.ts workflow.ts（跨表本地事务）
+    └── scripts/verify-workflow.ts   # fake-indexeddb 事务 / 归并迁移验证（npm run verify）
 ```
 
 ## 六、数据存储说明
 
 - **存储介质**：浏览器 IndexedDB，库名 **`gbelevsvc`**，通过 Dexie 4.x 封装。
-- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 2`，并登记 v1 → v2 的 `upgrade` 迁移（补齐行修订号、迁移 `executorName → executor`、初始化保养项结果字段、新增 `settings` 表）。
+- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 3`，并登记 v1 → v2、v2 → v3 的 `upgrade` 迁移（v2：补齐行修订号、迁移 `executorName → executor`、初始化保养项结果字段、新增 `settings` 表；v3：整改单新增 `sourceItemId` 唯一索引与 `masterId / mergedFrom` 归并字段、新增「待复核」状态，升级时自动把历史重复整改单归并为主单并留来源）。
 - **数据表**：
 
   | 表名 | 实体 | 主要索引 |
@@ -99,11 +100,15 @@ sologsb101-1003/
   | `plans` | 保养计划 | id / elevatorId / cycleType / state / planDate / executor / [elevatorId+planDate] |
   | `checkItems` | 保养项 | id / planId / seq / result / itemName / [planId+seq] |
   | `rescues` | 困人事件 | id / elevatorId / alarmAt / responder |
-  | `rectifies` | 整改单 | id / elevatorId / state / dueDate / reviewer |
+  | `rectifies` | 整改单 | id / elevatorId / state / dueDate / reviewer / masterId / &sourceItemId（唯一） |
   | `settings` | 自定义字典 | id |
 
 - **首屏自动播种**：`initDatabase()` 在 `elevators` 表为空时写入演示数据（幂等）——3 台电梯 × 各 2~4 期计划 × 每期 5~10 个保养项（含异常 / 建议项）+ 3 起困人事件 + 5 条整改单，父子记录通过 `elevatorId / planId` 互相引用。
 - **跨页状态**：全部放在 Pinia store（`elevatorStore / planStore / checkStore / rescueStore / rectifyStore`），页面只读 store；Dexie 写入后由 `utils/events.ts` 广播，各 store 自动重新拉取。
+- **跨表本地事务（`utils/workflow.ts`）**：保养项签署保存、异常项转整改、计划改期 / 更换电梯、异常项作废这几类跨表动作均在单个 Dexie 事务内提交 `checkItems + plans + rectifies`，任一写入失败整笔回滚，签署草稿与已完成项不落地、可原样重试。异常转整改的单子带 `sourceItemId` 唯一索引（同进程再有 in-flight 合并），同一异常只保留一条有效主单，并发 / 重复提交直接返回已有单。
+- **复核回流**：整改单状态为待整改 / 待复核 / 已复核。计划改期、更换电梯或异常项作废后，来源**未复核**的整改单自动回到「待复核」队列；**已复核**结论锁定不动。
+- **重复单归并**：v3 升级（及 JSON 导入）时历史重复整改单按来源保养项 / 电梯 + 项目 + 限期归并：一条主单保留业务，其余转为从单并在主单 `mergedFrom` 留痕；列表、统计与 CSV 导出只按主单展示，JSON 备份仍保留全部行。
+- 事务工作流的端到端验证（fake-indexeddb，29 项断言）：`cd frontend && npm run verify`。
 - **数据不出浏览器**：容器无状态，不挂载卷、不使用数据库服务。
 
 ## 七、本地开发
@@ -113,6 +118,7 @@ cd frontend
 npm install
 npm run dev        # http://localhost:22803
 npm run typecheck  # vue-tsc --noEmit
+npm run verify     # 事务工作流端到端验证（fake-indexeddb）
 npm run build      # vue-tsc --noEmit && vite build
 npm run preview    # 预览构建产物
 ```

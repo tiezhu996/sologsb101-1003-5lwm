@@ -23,6 +23,12 @@ import {
   type CheckItemView,
   type CheckResult,
 } from '../types/checkItem';
+import {
+  deleteCheckItemTx,
+  saveCheckItemsTx,
+  setCheckResultTx,
+  type SaveItemsResult,
+} from '../utils/workflow';
 import { nowDateTime } from '../utils/duration';
 import { uuid } from '../utils/export';
 import { emitChange, onChange } from '../utils/events';
@@ -121,63 +127,59 @@ export const useCheckStore = defineStore('check', () => {
     };
   });
 
-  /** 保存单项结果 */
-  async function saveItem(itemId: string, draft: CheckItemDraft): Promise<void> {
+  /** 保存单项结果（异常改正常时同事务回流关联整改单到待复核） */
+  async function saveItem(itemId: string, draft: CheckItemDraft): Promise<SaveItemsResult> {
     const existing = items.value.find((item) => item.id === itemId);
-    if (!existing) return;
-    await putCheckItem({
-      ...existing,
-      itemName: draft.itemName.trim(),
-      result: draft.result,
-      value: draft.value.trim(),
-      remark: draft.remark.trim(),
-    });
+    if (!existing) return { updated: 0, reopened: [] };
+    // 单项复用计划维度的事务保存，保证与签署 / 转整改同一口径
+    const result = await saveCheckItemsTx(existing.planId, [{ id: itemId, ...draft }]);
     emitChange();
+    return result;
   }
 
-  /** 批量保存当前计划的全部结果 */
+  /**
+   * 批量保存当前计划的全部结果（一次本地事务）。
+   * 事务失败整体回滚：内存草稿与已完成项都不被破坏，调用方可原样重试。
+   */
   async function saveAll(planId: string, drafts: Array<{ id: string } & CheckItemDraft>): Promise<number> {
-    const rows: CheckItemRow[] = [];
-    for (const draft of drafts) {
-      const existing = items.value.find((item) => item.id === draft.id);
-      if (!existing) continue;
-      rows.push({
-        ...existing,
-        itemName: draft.itemName.trim(),
+    if (drafts.length === 0) return 0;
+    const result = await saveCheckItemsTx(
+      planId,
+      drafts.map((draft) => ({
+        id: draft.id,
+        itemName: draft.itemName,
         result: draft.result,
-        value: draft.value.trim(),
-        remark: draft.remark.trim(),
-      });
-    }
-    if (rows.length === 0) return 0;
-    await putCheckItems(rows);
-    void planId;
+        value: draft.value,
+        remark: draft.remark,
+      })),
+    );
     emitChange();
-    return rows.length;
+    return result.updated;
   }
 
-  /** 快捷设置某一项结果 */
-  async function setResult(itemId: string, result: CheckResult): Promise<void> {
-    const existing = items.value.find((item) => item.id === itemId);
-    if (!existing) return;
-    await putCheckItem({ ...existing, result });
+  /** 快捷设置某一项结果（异常项作废时关联整改单同事务回到待复核） */
+  async function setResult(itemId: string, result: CheckResult): Promise<SaveItemsResult> {
+    const outcome = await setCheckResultTx(itemId, result);
     emitChange();
+    return outcome;
   }
 
-  /** 一键将当前计划全部未填项标为正常 */
+  /** 一键将当前计划全部未填项标为正常（单事务批量落库） */
   async function fillRestNormal(planId: string): Promise<number> {
     const targets = items.value.filter((item) => item.planId === planId && item.result === null);
     if (targets.length === 0) return 0;
-    await putCheckItems(
+    const result = await saveCheckItemsTx(
+      planId,
       targets.map((item) => ({
-        ...item,
+        id: item.id,
+        itemName: item.itemName,
         result: 'normal' as CheckResult,
         value: item.value || '符合要求',
         remark: item.remark || '',
       })),
     );
     emitChange();
-    return targets.length;
+    return result.updated;
   }
 
   /** 追加自定义保养项 */
@@ -200,7 +202,7 @@ export const useCheckStore = defineStore('check', () => {
   }
 
   async function deleteItem(itemId: string): Promise<void> {
-    await removeCheckItem(itemId);
+    await deleteCheckItemTx(itemId);
     emitChange();
   }
 
